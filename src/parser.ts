@@ -13,41 +13,63 @@ interface TempFolder {
 	children: (TempFolder | TempBookmark)[];
 }
 
-// Internal types for event stream
-type Event =
-	| { type: 'enter_level' }
-	| { type: 'exit_level' }
-	| { type: 'folder'; name: string }
-	| { type: 'bookmark'; name: string; url: string };
-
 export async function parseBookmarks(html: string): Promise<Category[]> {
 	if (!html || !html.trim()) {
 		return [];
 	}
 
-	// --- Stage 1: HTML -> Event Stream ---
-	const events: Event[] = [];
-	let lastBookmark: { name: string; url: string } | null = null;
+	// --- Stage 1: Directly build a lightweight memory tree ---
+	const root: TempFolder = { type: 'folder', name: 'root', children: [] };
+	const stack: TempFolder[] = [root];
+	let lastTextParent: TempFolder | null = null;
+    let lastBookmark: TempBookmark | null = null;
 
 	const rewriter = new HTMLRewriter()
-		.on('dl', { element: () => events.push({ type: 'enter_level' }) })
-		.on('dl:end', { element: () => events.push({ type: 'exit_level' }) })
-		.on('h3', {
-			text: (text) => {
-				if (text.text) {
-					events.push({ type: 'folder', name: text.text.trim() });
+		.on('dl', {
+			element: () => {
+                // When we enter a <dl>, the parent folder is the one on top of the stack.
+                // The actual folder for this <dl> is the *last* folder that was added to the parent.
+				const parent = stack[stack.length - 1];
+				const folderForThisDl = parent.children.slice().reverse().find(c => c.type === 'folder') as TempFolder | undefined;
+				
+                if (folderForThisDl) {
+					stack.push(folderForThisDl);
 				}
+			},
+			end: () => {
+				// Exit a level of nesting
+				if (stack.length > 1) {
+					stack.pop();
+				}
+			},
+		})
+		.on('h3', {
+			element: () => {
+				// Prepare for the folder name text
+				lastTextParent = stack[stack.length - 1];
+			},
+			text: (text) => {
+				// Create the new folder and add it to the current parent
+				if (text.text && lastTextParent) {
+					lastTextParent.children.push({ type: 'folder', name: text.text.trim(), children: [] });
+				}
+                if (text.lastInTextNode) {
+                    lastTextParent = null;
+                }
 			},
 		})
 		.on('a', {
 			element: (el) => {
-				lastBookmark = { url: el.getAttribute('href') || '', name: '' };
+                // Create a bookmark object, ready to receive its name
+				lastBookmark = { type: 'bookmark', url: el.getAttribute('href') || '', name: '' };
 			},
 			text: (text) => {
 				if (lastBookmark && text.text) {
+                    // Append text chunks to the name (handles multi-line names)
 					lastBookmark.name += text.text;
 					if (text.lastInTextNode) {
-						events.push({ type: 'bookmark', ...lastBookmark });
+						const parent = stack[stack.length - 1];
+						parent.children.push(lastBookmark);
 						lastBookmark = null;
 					}
 				}
@@ -56,36 +78,7 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 
 	await rewriter.transform(new Response(html)).text();
 
-	// --- Stage 2: Event Stream -> Memory Tree ---
-	const root: TempFolder = { type: 'folder', name: 'root', children: [] };
-	const stack: TempFolder[] = [root];
-
-	for (const event of events) {
-		let currentFolder = stack[stack.length - 1];
-		switch (event.type) {
-			case 'enter_level':
-				const lastChild = currentFolder.children.length > 0 ? currentFolder.children[currentFolder.children.length - 1] : null;
-				if (lastChild && lastChild.type === 'folder') {
-					stack.push(lastChild);
-				} else {
-                    stack.push(currentFolder);
-                }
-				break;
-			case 'exit_level':
-				if (stack.length > 1) {
-					stack.pop();
-				}
-				break;
-			case 'folder':
-				currentFolder.children.push({ type: 'folder', name: event.name, children: [] });
-				break;
-			case 'bookmark':
-				currentFolder.children.push({ type: 'bookmark', name: event.name.trim(), url: event.url });
-				break;
-		}
-	}
-
-	// --- Stage 3: Memory Tree -> Final JSON (Flattening) ---
+	// --- Stage 2: Memory Tree -> Final JSON (Flattening) ---
 	const finalCategories: Category[] = [];
 	const unclassified: Bookmark[] = [];
 
@@ -105,6 +98,7 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 	};
 
 	if (topLevelFolders.length === 1) {
+		// "Smart Drilldown" mode
 		const singleRootFolder = topLevelFolders[0];
 		for (const child of singleRootFolder.children) {
 			if (child.type === 'folder') {
@@ -116,7 +110,8 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 				unclassified.push({ name: child.name, url: child.url });
 			}
 		}
-	} else { 
+	} else {
+		// "Standard" mode
 		for (const folder of topLevelFolders) {
 			finalCategories.push({
 				name: folder.name,
