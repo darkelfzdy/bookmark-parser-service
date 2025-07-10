@@ -21,14 +21,14 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 	// --- Stage 1: Directly build a lightweight memory tree ---
 	const root: TempFolder = { type: 'folder', name: 'root', children: [] };
 	const stack: TempFolder[] = [root];
-	let lastTextParent: TempFolder | null = null;
-    let lastBookmark: TempBookmark | null = null;
+	let lastBookmark: TempBookmark | null = null;
+    let h3Text = '';
+    let lastTextParent: TempFolder | null = null;
+
 
 	const rewriter = new HTMLRewriter()
 		.on('dl', {
 			element: () => {
-                // When we enter a <dl>, the parent folder is the one on top of the stack.
-                // The actual folder for this <dl> is the *last* folder that was added to the parent.
 				const parent = stack[stack.length - 1];
 				const folderForThisDl = parent.children.slice().reverse().find(c => c.type === 'folder') as TempFolder | undefined;
 				
@@ -37,7 +37,6 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 				}
 			},
 			end: () => {
-				// Exit a level of nesting
 				if (stack.length > 1) {
 					stack.pop();
 				}
@@ -45,27 +44,27 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 		})
 		.on('h3', {
 			element: () => {
-				// Prepare for the folder name text
-				lastTextParent = stack[stack.length - 1];
+                lastTextParent = stack[stack.length - 1];
+                h3Text = ''; // Reset accumulator
 			},
 			text: (text) => {
-				// Create the new folder and add it to the current parent
-				if (text.text && lastTextParent) {
-					lastTextParent.children.push({ type: 'folder', name: text.text.trim(), children: [] });
+				if (text.text) {
+					h3Text += text.text;
 				}
                 if (text.lastInTextNode) {
-                    lastTextParent = null;
+                    if (lastTextParent && h3Text.trim()) {
+                        lastTextParent.children.push({ type: 'folder', name: h3Text.trim(), children: [] });
+                    }
+                    lastTextParent = null; // Reset parent tracker
                 }
 			},
 		})
 		.on('a', {
 			element: (el) => {
-                // Create a bookmark object, ready to receive its name
 				lastBookmark = { type: 'bookmark', url: el.getAttribute('href') || '', name: '' };
 			},
 			text: (text) => {
 				if (lastBookmark && text.text) {
-                    // Append text chunks to the name (handles multi-line names)
 					lastBookmark.name += text.text;
 					if (text.lastInTextNode) {
 						const parent = stack[stack.length - 1];
@@ -97,7 +96,8 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 		return bms;
 	};
 
-	if (topLevelFolders.length === 1) {
+	// MODIFIED: Trigger "Smart Drilldown" only if there's one folder AND no loose bookmarks at the top level.
+	if (topLevelFolders.length === 1 && topLevelBookmarks.length === 0) {
 		// "Smart Drilldown" mode
 		const singleRootFolder = topLevelFolders[0];
 		for (const child of singleRootFolder.children) {
@@ -123,10 +123,15 @@ export async function parseBookmarks(html: string): Promise<Category[]> {
 	unclassified.push(...topLevelBookmarks.map((b) => ({ name: b.name, url: b.url })));
 
 	if (unclassified.length > 0) {
-		finalCategories.push({
-			name: '未分类书签',
-			bookmarks: unclassified,
-		});
+        const existingUnclassified = finalCategories.find(c => c.name === '未分类书签');
+        if (existingUnclassified) {
+            existingUnclassified.bookmarks.push(...unclassified);
+        } else {
+		    finalCategories.push({
+			    name: '未分类书签',
+			    bookmarks: unclassified,
+		    });
+        }
 	}
 
 	return finalCategories;
